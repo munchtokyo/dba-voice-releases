@@ -1,0 +1,278 @@
+name: Repack approved Mac preview as DMG
+run-name: Repack mac-preview-0.13.4 without changing the app
+
+'on':
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: dba-voice-repack-mac-preview-0.13.4
+  cancel-in-progress: false
+
+jobs:
+  repack:
+    if: github.repository == 'munchtokyo/dba-voice-releases' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      REPACK_DIR: ${{ runner.temp }}/dba-voice-lossless-repack
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download the approved ZIP, build DMG, and verify unchanged app
+        run: |
+          set -euo pipefail
+          command -v python3
+          command -v curl
+          command -v ditto
+          command -v hdiutil
+          command -v codesign
+          command -v gh
+          python3 - <<'PY_REPACK'
+          """Create and verify a lossless DMG from one fixed, publicly released ZIP."""
+          import collections
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import plistlib
+          import stat
+          import subprocess
+          import urllib.request
+          import zipfile
+
+          REPO = "munchtokyo/dba-voice-releases"
+          TAG = "mac-preview-0.13.4"
+          ZIP_NAME = "DBA-Voice-Mac.zip"
+          ZIP_SHA256 = "74114f85770c79a9fb8f9d7d155a51b34d6a225ba6357affcc989aa5e24a2e17"
+          MODEL_PATH = "Contents/Resources/Models/ggml-large-v3-turbo.bin"
+          MODEL_SHA256 = "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+          MODEL_BYTES = 1624555275
+          ASSET_NAMES = ("DBA-Voice-Mac.dmg", "DBA-Voice-Mac.dmg.sha256", "DBA-Voice-Mac.dmg.verification.json")
+
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+
+          def snapshot(root):
+              """Never follow symlinks; include root, all directories, files and links."""
+              entries = {}
+
+              def visit(path, relative):
+                  info = path.lstat()
+                  entry = {"execute_bits": stat.S_IMODE(info.st_mode) & 0o111}
+                  if stat.S_ISLNK(info.st_mode):
+                      entry.update(kind="symlink", target=os.readlink(path))
+                  elif stat.S_ISREG(info.st_mode):
+                      entry.update(kind="file", bytes=info.st_size, sha256=sha256(path))
+                  elif stat.S_ISDIR(info.st_mode):
+                      entry["kind"] = "directory"
+                  else:
+                      raise RuntimeError(f"Unsupported bundle entry type: {relative}")
+                  entries[relative] = entry
+                  if entry["kind"] == "directory":
+                      for child in sorted(path.iterdir(), key=lambda p: p.name):
+                          visit(child, child.relative_to(root).as_posix())
+
+              visit(root, ".")
+              return entries
+
+
+          def canonical_bytes(value):
+              return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+          def require_same(expected, actual, label):
+              changed = [key for key in sorted(set(expected) | set(actual)) if expected.get(key) != actual.get(key)]
+              if changed:
+                  raise RuntimeError(f"{label}: {len(changed)} differing entries; first entries: {changed[:8]}")
+
+
+          def run(*args):
+              subprocess.run([str(arg) for arg in args], check=True)
+
+
+          def main():
+              work = Path(os.environ["REPACK_DIR"])
+              work.mkdir(parents=True, exist_ok=False)
+              release_request = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}/releases/tags/{TAG}",
+                  headers={"Accept": "application/vnd.github+json", "User-Agent": "DBA-Voice-lossless-repack"},
+              )
+              with urllib.request.urlopen(release_request, timeout=45) as response:
+                  release = json.load(response)
+              if release.get("tag_name") != TAG or release.get("draft"):
+                  raise RuntimeError("Expected existing published release was not found")
+              existing = {asset["name"] for asset in release["assets"]}
+              if existing.intersection(ASSET_NAMES):
+                  raise RuntimeError("A target asset already exists; refusing to replace anything")
+              if ZIP_NAME not in existing:
+                  raise RuntimeError("The original ZIP is missing from the existing release")
+
+              source_zip = work / ZIP_NAME
+              source_url = f"https://github.com/{REPO}/releases/download/{TAG}/{ZIP_NAME}"
+              run("curl", "--fail", "--location", "--retry", "3", "--retry-delay", "5",
+                  "--connect-timeout", "30", "--max-time", "1800", "--output", source_zip, source_url)
+              if sha256(source_zip) != ZIP_SHA256:
+                  raise RuntimeError("Source ZIP SHA256 does not match the fixed approved archive")
+              with zipfile.ZipFile(source_zip) as archive:
+                  for entry in archive.infolist():
+                      name = PurePosixPath(entry.filename)
+                      if name.is_absolute() or ".." in name.parts:
+                          raise RuntimeError("Archive contains an unsafe extraction path")
+                  bad = archive.testzip()
+                  if bad is not None:
+                      raise RuntimeError(f"ZIP integrity failed: {bad}")
+
+              unpacked = work / "unpacked"
+              unpacked.mkdir()
+              run("ditto", "-x", "-k", source_zip, unpacked)
+              app = unpacked / "DBA Voice.app"
+              if not app.is_dir() or app.is_symlink():
+                  raise RuntimeError("Expected top-level DBA Voice.app was not found")
+              with (app / "Contents/Info.plist").open("rb") as stream:
+                  info = plistlib.load(stream)
+              if info.get("CFBundleShortVersionString") != "0.13.4":
+                  raise RuntimeError("Unexpected app version in the fixed source ZIP")
+
+              original = snapshot(app)
+              model_entry = original.get(MODEL_PATH, {})
+              if (model_entry.get("kind") != "file" or model_entry.get("sha256") != MODEL_SHA256
+                      or model_entry.get("bytes") != MODEL_BYTES):
+                  raise RuntimeError("Bundled model differs from the approved original model")
+              (work / "original-app-snapshot.json").write_bytes(canonical_bytes(original))
+              run("codesign", "--verify", "--deep", "--strict", app)
+              stage = work / "stage"
+              stage.mkdir()
+              staged_app = stage / app.name
+              run("ditto", "--rsrc", "--extattr", app, staged_app)
+              (stage / "Applications").symlink_to("/Applications", target_is_directory=True)
+              require_same(original, snapshot(staged_app), "Original versus staging")
+
+              dmg = work / ASSET_NAMES[0]
+              run("hdiutil", "create", "-srcfolder", stage, "-volname", "DBA Voice", "-fs", "HFS+",
+                  "-format", "ULMO", "-srcowners", "any", "-nospotlight", dmg)
+              run("hdiutil", "verify", dmg)
+              mount = work / "mounted"
+              mount.mkdir()
+              attached = False
+              try:
+                  run("hdiutil", "attach", "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", mount, dmg)
+                  attached = True
+                  if not (os.statvfs(mount).f_flag & os.ST_RDONLY):
+                      raise RuntimeError("DMG was not mounted read-only")
+                  mounted_app = mount / app.name
+                  require_same(original, snapshot(mounted_app), "Original versus mounted DMG")
+                  applications = mount / "Applications"
+                  if not applications.is_symlink() or os.readlink(applications) != "/Applications":
+                      raise RuntimeError("Applications shortcut was not preserved")
+                  run("codesign", "--verify", "--deep", "--strict", mounted_app)
+              finally:
+                  if attached:
+                      run("hdiutil", "detach", mount)
+
+              dmg_sha = sha256(dmg)
+              (work / ASSET_NAMES[1]).write_text(f"{dmg_sha}  {ASSET_NAMES[0]}\n", encoding="utf-8")
+              report = {
+                  "schema_version": 1,
+                  "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "repository": REPO,
+                  "release_tag": TAG,
+                  "source_zip": {"name": ZIP_NAME, "sha256": ZIP_SHA256, "bytes": source_zip.stat().st_size},
+                  "dmg": {"name": dmg.name, "sha256": dmg_sha, "bytes": dmg.stat().st_size, "format": "ULMO", "filesystem": "HFS+"},
+                  "app": {
+                      "name": app.name,
+                      "version": info["CFBundleShortVersionString"],
+                      "build": info.get("CFBundleVersion"),
+                      "model": {"path": MODEL_PATH, "sha256": MODEL_SHA256, "bytes": MODEL_BYTES},
+                      "entry_count": len(original),
+                      "entries_by_kind": dict(collections.Counter(entry["kind"] for entry in original.values())),
+                      "snapshot_sha256": hashlib.sha256(canonical_bytes(original)).hexdigest(),
+                  },
+                  "verified": {
+                      "source_zip_sha256": True, "source_zip_integrity": True,
+                      "staging_entry_differences": 0, "mounted_entry_differences": 0,
+                      "entry_checks": ["path", "kind", "file_sha256", "file_bytes", "symlink_target", "execute_bits"],
+                      "disk_image_verify": True, "read_only_mount": True, "applications_symlink": True,
+                      "source_codesign_deep_strict": True, "mounted_codesign_deep_strict": True,
+                      "resigned": False,
+                  },
+                  "runner_macos": subprocess.check_output(["sw_vers", "-productVersion"], text=True).strip(),
+                  "workflow_run": f"https://github.com/{REPO}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              }
+              (work / ASSET_NAMES[2]).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+              # Only public package verification facts, never environment contents or tokens.
+              print(json.dumps(report, indent=2))
+
+
+          if __name__ == "__main__":
+              main()
+          PY_REPACK
+
+      - name: Add three new assets without changing existing release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$REPACK_DIR"
+          gh api "repos/munchtokyo/dba-voice-releases/releases/tags/mac-preview-0.13.4" > release-before-upload.json
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          names = ('DBA-Voice-Mac.dmg', 'DBA-Voice-Mac.dmg.sha256', 'DBA-Voice-Mac.dmg.verification.json')
+          release = json.loads(Path('release-before-upload.json').read_text())
+          assert release['tag_name'] == 'mac-preview-0.13.4' and not release['draft']
+          existing = {asset['name'] for asset in release['assets']}
+          if existing.intersection(names):
+              raise SystemExit('Target asset already exists; no upload, replacement, or deletion was performed')
+          report = json.loads(Path(names[2]).read_text())
+          assert report['verified']['mounted_entry_differences'] == 0
+          assert report['verified']['mounted_codesign_deep_strict'] is True
+          assert report['verified']['resigned'] is False
+          digest = hashlib.sha256()
+          with Path(names[0]).open('rb') as stream:
+              for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+                  digest.update(block)
+          assert digest.hexdigest() == report['dmg']['sha256']
+          assert Path(names[0]).stat().st_size == report['dmg']['bytes']
+          assert Path(names[1]).read_text() == f"{digest.hexdigest()}  {names[0]}\n"
+          PY
+          # No --clobber: the CLI also rejects an asset-name collision after the check.
+          gh release upload mac-preview-0.13.4 \
+            DBA-Voice-Mac.dmg DBA-Voice-Mac.dmg.sha256 DBA-Voice-Mac.dmg.verification.json \
+            --repo munchtokyo/dba-voice-releases
+          gh api "repos/munchtokyo/dba-voice-releases/releases/tags/mac-preview-0.13.4" > release-after-upload.json
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          names = ('DBA-Voice-Mac.dmg', 'DBA-Voice-Mac.dmg.sha256', 'DBA-Voice-Mac.dmg.verification.json')
+          before = json.loads(Path('release-before-upload.json').read_text())
+          after = json.loads(Path('release-after-upload.json').read_text())
+          assert before['id'] == after['id']
+          assert before['tag_name'] == after['tag_name']
+          assert before['name'] == after['name'] and before['body'] == after['body']
+          assets = {asset['name']: asset for asset in after['assets']}
+          for asset in before['assets']:
+              current = assets[asset['name']]
+              assert all(current.get(field) == asset.get(field) for field in ('id', 'size', 'digest'))
+          for name in names:
+              path = Path(name)
+              digest = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+                      digest.update(block)
+              assert assets[name]['size'] == path.stat().st_size
+              assert assets[name].get('digest') == 'sha256:' + digest.hexdigest(), 'GitHub digest missing or mismatched; inspect the new assets manually'
+              print(f"Verified release asset: {name}, {path.stat().st_size} bytes, SHA256 {digest.hexdigest()}")
+          print('Original release metadata and all previously present assets are unchanged.')
+          PY
