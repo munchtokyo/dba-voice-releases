@@ -17,13 +17,13 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
-    env:
-      REPACK_DIR: ${{ runner.temp }}/dba-voice-lossless-repack
     defaults:
       run:
         shell: bash
     steps:
       - name: Download the approved ZIP, build DMG, and verify unchanged app
+        env:
+          REPACK_DIR: ${{ runner.temp }}/dba-voice-lossless-repack
         run: |
           set -euo pipefail
           command -v python3
@@ -221,6 +221,7 @@ jobs:
 
       - name: Add three new assets without changing existing release assets
         env:
+          REPACK_DIR: ${{ runner.temp }}/dba-voice-lossless-repack
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
